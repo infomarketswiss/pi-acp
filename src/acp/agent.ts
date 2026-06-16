@@ -10,11 +10,13 @@ import {
   type ListSessionsResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
-  type ModelInfo,
   type NewSessionRequest,
   type PromptRequest,
   type PromptResponse,
+  type SessionConfigOption,
   type SessionInfo,
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
   type StopReason
@@ -38,6 +40,14 @@ import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+type AdvertisedModel = {
+  modelId: string
+  name: string
+  description?: string | null
+}
+
+const MODEL_CONFIG_ID = 'model'
+const THOUGHT_LEVEL_CONFIG_ID = 'thought_level'
 
 function builtinAvailableCommands(): AvailableCommand[] {
   return [
@@ -245,8 +255,10 @@ export class PiAcpAgent implements ACPAgent {
       )
     }
 
-    const models = await getModelState(session.proc, { state, availableModels })
-    const thinking = await getThinkingState(session.proc, { state })
+    const { configOptions, models, modes } = await getSessionConfiguration(session.proc, {
+      state,
+      availableModels
+    })
 
     const quietStartup = getQuietStartup(params.cwd)
     const updateNotice = buildUpdateNotice()
@@ -275,8 +287,9 @@ export class PiAcpAgent implements ACPAgent {
 
     const response = {
       sessionId: session.sessionId,
+      configOptions,
       models,
-      modes: thinking,
+      modes,
       _meta: {
         piAcp: {
           startupInfo: preludeText || null
@@ -946,12 +959,12 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    const models = await getModelState(proc)
-    const thinking = await getThinkingState(proc)
+    const { configOptions, models, modes } = await getSessionConfiguration(proc)
 
     const response = {
+      configOptions,
       models,
-      modes: thinking,
+      modes,
       _meta: {
         piAcp: {
           startupInfo: null
@@ -996,36 +1009,8 @@ export class PiAcpAgent implements ACPAgent {
 
   async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
     const session = this.sessions.get(params.sessionId)
-
-    // Accept either:
-    //  - "provider/model" (preferred, matches how we advertise)
-    //  - "model" (fallback, we try to resolve via available models)
-    let provider: string | null = null
-    let modelId: string | null = null
-
-    if (params.modelId.includes('/')) {
-      const [p, ...rest] = params.modelId.split('/')
-      provider = p
-      modelId = rest.join('/')
-    } else {
-      modelId = params.modelId
-    }
-
-    if (!provider) {
-      const data = (await session.proc.getAvailableModels()) as any
-      const models: any[] = Array.isArray(data?.models) ? data.models : []
-      const found = models.find(m => String(m?.id) === modelId)
-      if (found) {
-        provider = String(found.provider)
-        modelId = String(found.id)
-      }
-    }
-
-    if (!provider || !modelId) {
-      throw RequestError.invalidParams(`Unknown modelId: ${params.modelId}`)
-    }
-
-    await session.proc.setModel(provider, modelId)
+    await setSessionModel(session.proc, params.modelId)
+    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1047,7 +1032,41 @@ export class PiAcpAgent implements ACPAgent {
       }
     })
 
+    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+
     return {}
+  }
+
+  async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
+    const session = this.sessions.get(params.sessionId)
+    const configId = String(params.configId)
+
+    if (typeof params.value !== 'string') {
+      throw RequestError.invalidParams(`Expected string value for config option: ${configId}`)
+    }
+
+    if (configId === MODEL_CONFIG_ID) {
+      await setSessionModel(session.proc, params.value)
+    } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
+      if (!isThinkingLevel(params.value)) {
+        throw RequestError.invalidParams(`Unknown thinking level: ${params.value}`)
+      }
+
+      await session.proc.setThinkingLevel(params.value)
+
+      void this.conn.sessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'current_mode_update',
+          currentModeId: params.value
+        }
+      })
+    } else {
+      throw RequestError.invalidParams(`Unknown config option: ${configId}`)
+    }
+
+    const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+    return { configOptions }
   }
 }
 
@@ -1094,15 +1113,91 @@ async function getThinkingState(
   }
 }
 
+async function getSessionConfiguration(
+  proc: PiRpcProcess,
+  pre?: { state?: any | null; availableModels?: any | null }
+): Promise<{
+  configOptions: SessionConfigOption[]
+  models: {
+    availableModels: AdvertisedModel[]
+    currentModelId: string
+  } | null
+  modes: {
+    availableModes: Array<{
+      id: string
+      name: string
+      description?: string | null
+    }>
+    currentModeId: string
+  }
+}> {
+  const [models, modes] = await Promise.all([getModelState(proc, pre), getThinkingState(proc, { state: pre?.state })])
+
+  return {
+    configOptions: buildConfigOptions({ models, modes }),
+    models,
+    modes
+  }
+}
+
+function buildConfigOptions(state: {
+  models: {
+    availableModels: AdvertisedModel[]
+    currentModelId: string
+  } | null
+  modes: {
+    availableModes: Array<{
+      id: string
+      name: string
+      description?: string | null
+    }>
+    currentModeId: string
+  }
+}): SessionConfigOption[] {
+  const configOptions: SessionConfigOption[] = [
+    {
+      type: 'select',
+      id: THOUGHT_LEVEL_CONFIG_ID,
+      category: 'thought_level',
+      name: 'Thinking',
+      description: 'Set the reasoning effort for this session',
+      currentValue: state.modes.currentModeId,
+      options: state.modes.availableModes.map(mode => ({
+        value: mode.id,
+        name: mode.name,
+        description: mode.description ?? null
+      }))
+    }
+  ]
+
+  if (state.models?.availableModels.length) {
+    configOptions.unshift({
+      type: 'select',
+      id: MODEL_CONFIG_ID,
+      category: 'model',
+      name: 'Model',
+      description: 'Select the model for this session',
+      currentValue: state.models.currentModelId,
+      options: state.models.availableModels.map(model => ({
+        value: model.modelId,
+        name: model.name,
+        description: model.description ?? null
+      }))
+    })
+  }
+
+  return configOptions
+}
+
 async function getModelState(
   proc: PiRpcProcess,
   pre?: { state?: any | null; availableModels?: any | null }
 ): Promise<{
-  availableModels: ModelInfo[]
+  availableModels: AdvertisedModel[]
   currentModelId: string
 } | null> {
   // Ask pi for available models.
-  let availableModels: ModelInfo[] = []
+  let availableModels: AdvertisedModel[] = []
 
   const data =
     pre?.availableModels ??
@@ -1126,9 +1221,9 @@ async function getModelState(
         modelId: `${provider}/${id}`,
         name: `${provider}/${name}`,
         description: null
-      } satisfies ModelInfo
+      } satisfies AdvertisedModel
     })
-    .filter(Boolean) as ModelInfo[]
+    .filter(Boolean) as AdvertisedModel[]
 
   // Ask pi what model is currently active.
   let currentModelId: string | null = null
@@ -1157,8 +1252,58 @@ async function getModelState(
 
   return {
     availableModels,
-    currentModelId
+    currentModelId: currentModelId ?? availableModels[0]?.modelId ?? 'default'
   }
+}
+
+async function emitConfigOptionsUpdate(
+  conn: AgentSideConnection,
+  sessionId: string,
+  proc: PiRpcProcess
+): Promise<SessionConfigOption[]> {
+  const { configOptions } = await getSessionConfiguration(proc)
+
+  await conn.sessionUpdate({
+    sessionId,
+    update: {
+      sessionUpdate: 'config_option_update',
+      configOptions
+    }
+  })
+
+  return configOptions
+}
+
+async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Promise<void> {
+  // Accept either:
+  //  - "provider/model" (preferred, matches how we advertise)
+  //  - "model" (fallback, resolve via available models)
+  let provider: string | null = null
+  let modelId: string | null = null
+
+  if (requestedModelId.includes('/')) {
+    const [candidateProvider, ...rest] = requestedModelId.split('/')
+    provider = candidateProvider
+    modelId = rest.join('/')
+  } else {
+    modelId = requestedModelId
+  }
+
+  if (!provider) {
+    const data = (await proc.getAvailableModels()) as any
+    const models: any[] = Array.isArray(data?.models) ? data.models : []
+    const found = models.find(m => String(m?.id) === modelId)
+    if (found) {
+      provider = String(found.provider)
+      modelId = String(found.id)
+    }
+  }
+
+  if (!provider || !modelId) {
+    throw RequestError.invalidParams(`Unknown modelId: ${requestedModelId}`)
+  }
+
+  await proc.setModel(provider, modelId)
 }
 
 function isSemver(v: string): boolean {

@@ -10,6 +10,11 @@ class FakeSessions {
     return this.session
   }
 
+  maybeGet(sessionId: string) {
+    if (sessionId !== this.session.sessionId) return undefined
+    return this.session
+  }
+
   get(sessionId: string) {
     if (sessionId !== this.session.sessionId) {
       throw new Error(`Unknown sessionId: ${sessionId}`)

@@ -22,10 +22,10 @@ import {
   type StopReason
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
-import { SessionManager } from './session.js'
+import { SessionManager, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
-import { listPiSessions, findPiSessionFile } from './pi-sessions.js'
+import { listPiSessions, findPiSession } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { promptToPiMessage } from './translate/prompt.js'
@@ -112,6 +112,7 @@ export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
+  private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
 
   dispose(): void {
     this.sessions.disposeAll()
@@ -142,6 +143,83 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     this.store.delete(sessionId)
+  }
+
+  private findStoredSession(sessionId: string): { cwd: string; sessionFile: string } | null {
+    const stored = this.store.get(sessionId)
+    if (stored?.cwd && stored?.sessionFile) {
+      return { cwd: stored.cwd, sessionFile: stored.sessionFile }
+    }
+
+    const piSession = findPiSession(sessionId)
+    if (!piSession) return null
+
+    this.store.upsert({
+      sessionId,
+      cwd: piSession.cwd,
+      sessionFile: piSession.sessionFile
+    })
+
+    return {
+      cwd: piSession.cwd,
+      sessionFile: piSession.sessionFile
+    }
+  }
+
+  private async restoreSession(
+    sessionId: string,
+    opts?: { cwd?: string; mcpServers?: LoadSessionRequest['mcpServers'] }
+  ): Promise<PiAcpSession> {
+    const existing = this.sessions.maybeGet(sessionId)
+    if (existing) return existing
+
+    const inFlight = this.restoringSessions.get(sessionId)
+    if (inFlight) return inFlight
+
+    const restorePromise = (async () => {
+      const stored = this.findStoredSession(sessionId)
+      if (!stored) {
+        throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
+      }
+
+      const cwd = opts?.cwd ?? stored.cwd
+
+      let proc: PiRpcProcess
+      try {
+        proc = await PiRpcProcess.spawn({
+          cwd,
+          sessionPath: stored.sessionFile,
+          piCommand: process.env.PI_ACP_PI_COMMAND
+        })
+      } catch (e: any) {
+        if (e?.name === 'PiRpcSpawnError') {
+          throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
+        }
+        throw e
+      }
+
+      const fileCommands = loadSlashCommands(cwd)
+      const session = this.sessions.getOrCreate(sessionId, {
+        cwd,
+        mcpServers: opts?.mcpServers ?? [],
+        conn: this.conn,
+        proc,
+        fileCommands
+      })
+
+      this.lastSessionCwd = cwd
+      this.store.upsert({ sessionId, cwd, sessionFile: stored.sessionFile })
+
+      return session
+    })()
+
+    this.restoringSessions.set(sessionId, restorePromise)
+
+    try {
+      return await restorePromise
+    } finally {
+      this.restoringSessions.delete(sessionId)
+    }
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -345,7 +423,7 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.restoreSession(params.sessionId)
 
     const { message, images } = promptToPiMessage(params.prompt)
 
@@ -802,7 +880,8 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
-    const session = this.sessions.get(params.sessionId)
+    const session = this.sessions.maybeGet(params.sessionId)
+    if (!session) return
     await session.cancel()
   }
 
@@ -847,40 +926,18 @@ export class PiAcpAgent implements ACPAgent {
 
     this.lastSessionCwd = params.cwd
 
-    // MVP: ignore mcpServers.
-    // Prefer ACP-created mapping first (fast path), otherwise scan pi sessions dir.
-    const stored = this.store.get(params.sessionId)
-    const sessionFile = stored?.sessionFile ?? findPiSessionFile(params.sessionId)
-
-    if (!sessionFile) {
+    const stored = this.findStoredSession(params.sessionId)
+    if (!stored) {
       throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
     }
 
-    // Spawn pi and point it directly at the session file.
-    let proc: PiRpcProcess
-    try {
-      proc = await PiRpcProcess.spawn({
-        cwd: params.cwd,
-        sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND
-      })
-    } catch (e: any) {
-      if (e?.name === 'PiRpcSpawnError') {
-        throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
-      }
-      throw e
-    }
-
-    const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
-
-    const session = this.sessions.getOrCreate(params.sessionId, {
+    const session = await this.restoreSession(params.sessionId, {
       cwd: params.cwd,
-      mcpServers: params.mcpServers,
-      conn: this.conn,
-      proc,
-      fileCommands
+      mcpServers: params.mcpServers
     })
+    const proc = session.proc
+    const fileCommands = loadSlashCommands(params.cwd)
 
     // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
     // (Tests sometimes stub out `this.sessions`, so guard the call.)
@@ -890,7 +947,7 @@ export class PiAcpAgent implements ACPAgent {
     this.store.upsert({
       sessionId: params.sessionId,
       cwd: params.cwd,
-      sessionFile
+      sessionFile: stored.sessionFile
     })
 
     // Replay full conversation history.
@@ -1008,13 +1065,13 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.restoreSession(params.sessionId)
     await setSessionModel(session.proc, params.modelId)
     await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.restoreSession(params.sessionId)
 
     const mode = String(params.modeId)
     if (!isThinkingLevel(mode)) {
@@ -1038,7 +1095,7 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.restoreSession(params.sessionId)
     const configId = String(params.configId)
 
     if (typeof params.value !== 'string') {
